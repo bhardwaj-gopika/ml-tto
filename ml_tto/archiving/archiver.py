@@ -1,0 +1,345 @@
+"""Area-based PV archiver.
+
+Resolves one or more beamline areas (via :mod:`slac_db`) to a flat PV list,
+optionally appends user-supplied extra PVs, then reads the PVs with
+``epics.caget_many`` either once (:func:`snapshot`) or at a fixed cadence
+(:func:`continuous`). Results land in a single HDF5 file following the
+Cropp data-sharing standard v0.1.2
+(https://github.com/ericcropp/Data_Sharing).
+
+Rate note: Python ``caget_many`` + ``time.sleep`` pacing is reliable at
+roughly 1-10 Hz for modest PV counts. Beam-rate (120 Hz) archiving is out
+of scope here and would require EPICS monitors instead.
+
+Units note: ``@units`` is written as ``""`` because slac_db accessor rows
+do not expose units uniformly. Post-process the file if units are needed.
+"""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Iterable, Union
+
+import h5py
+import numpy as np
+
+_DATA_STANDARD_VERSION = "0.1.2"
+
+logger = logging.getLogger(__name__)
+
+
+def _isotime() -> str:
+    return (
+        datetime.datetime.now()
+        .replace(tzinfo=datetime.timezone.utc)
+        .astimezone()
+        .replace(microsecond=0)
+        .isoformat()
+    )
+
+
+def _as_area_list(areas: Union[str, Iterable[str]]) -> list[str]:
+    if isinstance(areas, str):
+        return [areas]
+    return list(areas)
+
+
+def _resolve_pvs(
+    areas: Union[str, Iterable[str]],
+    extra_pvs: Iterable[str],
+    include_inactive: bool,
+) -> list[tuple[str, str]]:
+    """Return a dedup list of ``(pv, location)`` pairs.
+
+    First occurrence wins (preserves the area that introduced the PV).
+    Extras are appended last with ``location=""``.
+    """
+    import slac_db.device as _sdb
+
+    seen: dict[str, str] = {}
+    for area in _as_area_list(areas):
+        for device in _sdb.get_devices(area=area, include_inactive=include_inactive):
+            for pv in _sdb.get_all_addresses(device):
+                if pv not in seen:
+                    seen[pv] = area
+    for pv in extra_pvs:
+        if pv not in seen:
+            seen[pv] = ""
+    return list(seen.items())
+
+
+def build_pv_list(
+    areas: Union[str, Iterable[str]],
+    extra_pvs: Iterable[str] = (),
+    include_inactive: bool = False,
+) -> list[tuple[str, str]]:
+    """Public wrapper around :func:`_resolve_pvs`."""
+    return _resolve_pvs(areas, extra_pvs, include_inactive)
+
+
+def _value_shape(v) -> tuple[int, ...]:
+    if v is None:
+        return ()
+    arr = np.asarray(v)
+    if arr.ndim == 0:
+        return ()
+    return arr.shape
+
+
+def _nan_block(shape: tuple[int, ...]):
+    if shape == ():
+        return np.nan
+    return np.full(shape, np.nan, dtype=np.float64)
+
+
+def _new_batch_id(source: str) -> str:
+    return hashlib.md5(f"{source}|{_isotime()}".encode()).hexdigest()
+
+
+def _open_file_and_batch(
+    path: Path,
+    batch_id: str,
+    n_samples: int,
+    source: str,
+    notes: str,
+    metadata: dict | None,
+    missing_pvs: list[str],
+) -> tuple[h5py.File, h5py.Group]:
+    f = h5py.File(path, "w")
+    f.attrs["Data_Standard_Version"] = _DATA_STANDARD_VERSION
+    f.attrs["IDs"] = np.array([batch_id], dtype=h5py.string_dtype("utf-8"))
+
+    batch = f.create_group(batch_id)
+    batch.attrs["Data_Standard_Version"] = _DATA_STANDARD_VERSION
+    batch.attrs["ID"] = batch_id
+    batch.attrs["batch_dims"] = np.array([n_samples], dtype=np.int64)
+    batch.attrs["run_information_source"] = source
+    batch.attrs["run_information_date"] = datetime.date.today().isoformat()
+
+    note_payload = {"notes": notes}
+    if metadata:
+        note_payload["metadata"] = metadata
+    if missing_pvs:
+        note_payload["missing_pvs"] = missing_pvs
+    batch.attrs["run_information_notes"] = json.dumps(note_payload)
+    return f, batch
+
+
+def _create_pv_dataset(
+    obs: h5py.Group,
+    pv: str,
+    location: str,
+    n_samples: int,
+    sample_shape: tuple[int, ...],
+) -> h5py.Dataset:
+    dtype = np.float64 if sample_shape == () else np.asarray(_nan_block(sample_shape)).dtype
+    dset = obs.create_dataset(
+        pv,
+        shape=(n_samples, *sample_shape),
+        maxshape=(None, *sample_shape),
+        dtype=dtype,
+    )
+    dset.attrs["location"] = location
+    dset.attrs["read_only"] = True
+    dset.attrs["num_feature_dims"] = len(sample_shape)
+    dset.attrs["units"] = ""
+    if sample_shape:
+        dset.attrs["bin_size"] = 1.0
+        dset.attrs["offset"] = 0.0
+    return dset
+
+
+def _create_timestamp_dataset(obs: h5py.Group, n_samples: int) -> h5py.Dataset:
+    dset = obs.create_dataset(
+        "Timestamp",
+        shape=(n_samples,),
+        maxshape=(None,),
+        dtype=h5py.string_dtype("utf-8"),
+    )
+    dset.attrs["read_only"] = True
+    dset.attrs["num_feature_dims"] = 0
+    dset.attrs["units"] = ""
+    return dset
+
+
+def _write_sample(
+    datasets: dict[str, h5py.Dataset],
+    ts_dset: h5py.Dataset,
+    i: int,
+    pvs: list[str],
+    values: list,
+    ts: str,
+) -> None:
+    if i >= ts_dset.shape[0]:
+        ts_dset.resize((i + 1,))
+        for d in datasets.values():
+            d.resize((i + 1, *d.shape[1:]))
+
+    ts_dset[i] = ts
+    for pv, v in zip(pvs, values):
+        if pv not in datasets:
+            continue
+        d = datasets[pv]
+        expected_shape = d.shape[1:]
+        if v is None:
+            d[i] = _nan_block(expected_shape)
+            continue
+        arr = np.asarray(v)
+        if arr.shape != expected_shape:
+            logger.warning(
+                "PV %s returned shape %s, expected %s; writing NaN",
+                pv,
+                arr.shape,
+                expected_shape,
+            )
+            d[i] = _nan_block(expected_shape)
+        else:
+            d[i] = arr
+
+
+def _initial_read(pvs: list[str], timeout: float) -> list:
+    from epics import caget_many
+
+    return caget_many(pvs, timeout=timeout)
+
+
+def _subsequent_read(pvs: list[str], timeout: float) -> list:
+    from epics import caget_many
+
+    return caget_many(pvs, timeout=timeout)
+
+
+def _run(
+    areas: Union[str, Iterable[str]],
+    extra_pvs: Iterable[str],
+    *,
+    path: Union[str, Path],
+    n_samples: int,
+    rate_hz: float | None,
+    run_source: str,
+    notes: str,
+    metadata: dict | None,
+    caget_timeout: float,
+    include_inactive: bool,
+) -> Path:
+    path = Path(path)
+    pv_loc = _resolve_pvs(areas, extra_pvs, include_inactive)
+    if not pv_loc:
+        raise ValueError("No PVs resolved for the requested areas / extras.")
+    pvs = [p for p, _ in pv_loc]
+
+    first_values = _initial_read(pvs, caget_timeout)
+    first_ts = _isotime()
+
+    missing = [pv for pv, v in zip(pvs, first_values) if v is None]
+    kept_pv_loc = [(pv, loc) for (pv, loc), v in zip(pv_loc, first_values) if v is not None]
+    kept_values = [v for v in first_values if v is not None]
+
+    if not kept_pv_loc:
+        raise RuntimeError("All PVs returned None on first read; nothing to archive.")
+
+    batch_id = _new_batch_id(run_source)
+    f, batch = _open_file_and_batch(
+        path=path,
+        batch_id=batch_id,
+        n_samples=n_samples,
+        source=run_source,
+        notes=notes,
+        metadata=metadata,
+        missing_pvs=missing,
+    )
+    try:
+        obs = batch.create_group("observables")
+        ts_dset = _create_timestamp_dataset(obs, n_samples)
+        datasets: dict[str, h5py.Dataset] = {}
+        for (pv, loc), v in zip(kept_pv_loc, kept_values):
+            datasets[pv] = _create_pv_dataset(obs, pv, loc, n_samples, _value_shape(v))
+
+        kept_pvs = [pv for pv, _ in kept_pv_loc]
+        _write_sample(datasets, ts_dset, 0, kept_pvs, kept_values, first_ts)
+
+        if n_samples > 1:
+            period = 1.0 / rate_hz if rate_hz else 0.0
+            target = time.monotonic() + period
+            for i in range(1, n_samples):
+                sleep_for = target - time.monotonic()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    logger.warning("Sample %d slipped by %.3fs", i, -sleep_for)
+                values = _subsequent_read(kept_pvs, caget_timeout)
+                _write_sample(datasets, ts_dset, i, kept_pvs, values, _isotime())
+                target += period
+    finally:
+        f.close()
+    return path
+
+
+def snapshot(
+    areas: Union[str, Iterable[str]],
+    extra_pvs: Iterable[str] = (),
+    *,
+    path: Union[str, Path],
+    run_source: str = "LCLS",
+    notes: str = "",
+    metadata: dict | None = None,
+    caget_timeout: float = 10.0,
+    include_inactive: bool = False,
+) -> Path:
+    """Read every PV once and write a single-sample Cropp-spec HDF5 file."""
+    return _run(
+        areas,
+        extra_pvs,
+        path=path,
+        n_samples=1,
+        rate_hz=None,
+        run_source=run_source,
+        notes=notes,
+        metadata=metadata,
+        caget_timeout=caget_timeout,
+        include_inactive=include_inactive,
+    )
+
+
+def continuous(
+    areas: Union[str, Iterable[str]],
+    extra_pvs: Iterable[str] = (),
+    *,
+    path: Union[str, Path],
+    rate_hz: float = 1.0,
+    n_samples: int | None = None,
+    duration_s: float | None = None,
+    run_source: str = "LCLS",
+    notes: str = "",
+    metadata: dict | None = None,
+    caget_timeout: float = 5.0,
+    include_inactive: bool = False,
+) -> Path:
+    """Sample at ``rate_hz`` and accumulate into one Cropp-spec HDF5 file.
+
+    Exactly one of ``n_samples`` or ``duration_s`` must be provided.
+    """
+    if (n_samples is None) == (duration_s is None):
+        raise ValueError("Provide exactly one of n_samples or duration_s.")
+    if rate_hz <= 0:
+        raise ValueError("rate_hz must be positive.")
+    if n_samples is None:
+        n_samples = max(1, int(round(duration_s * rate_hz)))
+
+    return _run(
+        areas,
+        extra_pvs,
+        path=path,
+        n_samples=n_samples,
+        rate_hz=rate_hz,
+        run_source=run_source,
+        notes=notes,
+        metadata=metadata,
+        caget_timeout=caget_timeout,
+        include_inactive=include_inactive,
+    )
