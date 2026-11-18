@@ -8,18 +8,18 @@ import numpy as np
 import pytest
 
 
-def _install_fake_slac_db(areas_to_devices, device_to_pvs):
+def _install_fake_slac_db(areas_to_devices, device_to_accessors):
     module = types.ModuleType("slac_db")
     device_mod = types.ModuleType("slac_db.device")
 
     def get_devices(area=None, include_inactive=False):
         return list(areas_to_devices.get(area, []))
 
-    def get_all_addresses(device):
-        return list(device_to_pvs.get(device, []))
+    def get_all_accessors(device):
+        return dict(device_to_accessors.get(device, {}))
 
     device_mod.get_devices = get_devices
-    device_mod.get_all_addresses = get_all_addresses
+    device_mod.get_all_accessors = get_all_accessors
     module.device = device_mod
     sys.modules["slac_db"] = module
     sys.modules["slac_db.device"] = device_mod
@@ -38,10 +38,10 @@ def archiver(monkeypatch):
             "GUNB": ["SOLN:IN20:121", "QUAD:IN20:121"],
             "HTR": ["QUAD:IN20:121", "QUAD:IN20:361"],
         },
-        device_to_pvs={
-            "SOLN:IN20:121": ["SOLN:IN20:121:BACT", "SOLN:IN20:121:BCTRL"],
-            "QUAD:IN20:121": ["QUAD:IN20:121:BACT", "QUAD:IN20:121:BCTRL"],
-            "QUAD:IN20:361": ["QUAD:IN20:361:BACT"],
+        device_to_accessors={
+            "SOLN:IN20:121": {"BACT": "SOLN:IN20:121:BACT", "BCTRL": "SOLN:IN20:121:BCTRL"},
+            "QUAD:IN20:121": {"BACT": "QUAD:IN20:121:BACT", "BCTRL": "QUAD:IN20:121:BCTRL"},
+            "QUAD:IN20:361": {"BACT": "QUAD:IN20:361:BACT"},
         },
     )
     sys.modules.pop("ml_tto.archiving", None)
@@ -113,6 +113,37 @@ def test_snapshot_writes_spec_conformant_h5(archiver, tmp_path):
         assert img.attrs["bin_size"] == 1.0
         assert img.attrs["offset"] == 0.0
         np.testing.assert_array_equal(img[0], image)
+
+
+def test_snapshot_handles_string_pv(archiver, tmp_path):
+    def fake_caget(pvs, timeout=None):
+        return [
+            "READY" if pv.endswith(":ACCESS") else 1.5
+            for pv in pvs
+        ]
+
+    _install_fake_epics(fake_caget)
+
+    out = tmp_path / "snap_str.h5"
+    archiver.snapshot(
+        [],
+        extra_pvs=["LGPS:IN20:1:BACT", "LGPS:IN20:1:ACCESS"],
+        path=out,
+    )
+
+    with h5py.File(out, "r") as f:
+        (batch_id,) = [s.decode() if isinstance(s, bytes) else s for s in f.attrs["IDs"]]
+        obs = f[batch_id]["observables"]
+
+        s = obs["LGPS:IN20:1:ACCESS"]
+        assert h5py.check_string_dtype(s.dtype) is not None
+        raw = s[0]
+        val = raw.decode() if isinstance(raw, bytes) else raw
+        assert val == "READY"
+
+        n = obs["LGPS:IN20:1:BACT"]
+        assert n.dtype == np.float64
+        assert n[0] == 1.5
 
 
 def test_continuous_appends_n_samples(archiver, tmp_path):

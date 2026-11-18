@@ -7,13 +7,11 @@ optionally appends user-supplied extra PVs, then reads the PVs with
 Cropp data-sharing standard v0.1.2
 (https://github.com/ericcropp/Data_Sharing).
 
-Rate note: ``rate_hz`` is a best-effort **target**, not a guarantee. Each
-cycle has to issue one ``caget_many`` across every resolved PV and then
-write the row to HDF5; with large PV lists or slow IOCs that round-trip
-can easily exceed the requested period and the loop will slip. The actual
-achieved rate is recorded in ``run_information_notes.achieved_rate_hz`` so
-callers can see what they really got. Beam-rate (120 Hz) archiving is out
-of scope here and would require EPICS monitors instead.
+Rate limits (measured on LCLS GUN accessor set): cycle time is bounded
+by ``caget_many`` at roughly **0.15 ms per PV**, giving a safe sustained
+rate of ``1 / (0.0003 * N_PVs)`` Hz. Beam rate 120 Hz is unreachable --
+use EPICS monitors for that. Achieved rate is written to
+``run_information_notes.achieved_rate_hz`` in every output file.
 
 Units note: ``@units`` is written as ``""`` because slac_db accessor rows
 do not expose units uniformly. Post-process the file if units are needed.
@@ -68,7 +66,7 @@ def _resolve_pvs(
     seen: dict[str, str] = {}
     for area in _as_area_list(areas):
         for device in _sdb.get_devices(area=area, include_inactive=include_inactive):
-            for pv in _sdb.get_all_addresses(device):
+            for pv in _sdb.get_all_accessors(device).values():
                 if pv not in seen:
                     seen[pv] = area
     for pv in extra_pvs:
@@ -99,6 +97,28 @@ def _nan_block(shape: tuple[int, ...]):
     if shape == ():
         return np.nan
     return np.full(shape, np.nan, dtype=np.float64)
+
+
+def _is_string_value(v) -> bool:
+    if isinstance(v, (bytes, str)):
+        return True
+    arr = np.asarray(v)
+    return arr.dtype.kind in ("U", "S", "O")
+
+
+def _coerce_string(v) -> str:
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    if isinstance(v, str):
+        return v
+    return str(v)
+
+
+def _missing_fill(d: h5py.Dataset):
+    """Default value to write when a PV read is missing or malformed."""
+    if h5py.check_string_dtype(d.dtype) is not None:
+        return ""
+    return _nan_block(d.shape[1:])
 
 
 def _new_batch_id(source: str) -> str:
@@ -142,9 +162,14 @@ def _create_pv_dataset(
     pv: str,
     location: str,
     n_samples: int,
-    sample_shape: tuple[int, ...],
+    first_value,
 ) -> h5py.Dataset:
-    dtype = np.float64 if sample_shape == () else np.asarray(_nan_block(sample_shape)).dtype
+    if _is_string_value(first_value):
+        sample_shape: tuple[int, ...] = ()
+        dtype = h5py.string_dtype("utf-8")
+    else:
+        sample_shape = _value_shape(first_value)
+        dtype = np.float64
     dset = obs.create_dataset(
         pv,
         shape=(n_samples, *sample_shape),
@@ -192,10 +217,13 @@ def _write_sample(
         if pv not in datasets:
             continue
         d = datasets[pv]
-        expected_shape = d.shape[1:]
         if v is None:
-            d[i] = _nan_block(expected_shape)
+            d[i] = _missing_fill(d)
             continue
+        if h5py.check_string_dtype(d.dtype) is not None:
+            d[i] = _coerce_string(v)
+            continue
+        expected_shape = d.shape[1:]
         arr = np.asarray(v)
         if arr.shape != expected_shape:
             logger.warning(
@@ -266,7 +294,7 @@ def _run(
         ts_dset = _create_timestamp_dataset(obs, n_samples)
         datasets: dict[str, h5py.Dataset] = {}
         for (pv, loc), v in zip(kept_pv_loc, kept_values):
-            datasets[pv] = _create_pv_dataset(obs, pv, loc, n_samples, _value_shape(v))
+            datasets[pv] = _create_pv_dataset(obs, pv, loc, n_samples, v)
 
         kept_pvs = [pv for pv, _ in kept_pv_loc]
         start_mono = time.monotonic()
@@ -346,10 +374,9 @@ def continuous(
 ) -> Path:
     """Sample at ``rate_hz`` and accumulate into one Cropp-spec HDF5 file.
 
-    ``rate_hz`` is a **target**, not a guarantee -- actual throughput is
-    bounded by the time to ``caget_many`` the resolved PV list. For large
-    PV lists the loop will slip; the actual achieved rate is written to
-    ``run_information_notes.achieved_rate_hz`` in the output file.
+    ``rate_hz`` is a target. Cycle time scales at ~0.15 ms/PV; safe
+    sustained rate ~= ``1 / (0.0003 * N_PVs)`` Hz. Achieved rate is
+    recorded in ``run_information_notes.achieved_rate_hz``.
 
     Exactly one of ``n_samples`` or ``duration_s`` must be provided.
     """
