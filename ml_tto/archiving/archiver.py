@@ -7,8 +7,12 @@ optionally appends user-supplied extra PVs, then reads the PVs with
 Cropp data-sharing standard v0.1.2
 (https://github.com/ericcropp/Data_Sharing).
 
-Rate note: Python ``caget_many`` + ``time.sleep`` pacing is reliable at
-roughly 1-10 Hz for modest PV counts. Beam-rate (120 Hz) archiving is out
+Rate note: ``rate_hz`` is a best-effort **target**, not a guarantee. Each
+cycle has to issue one ``caget_many`` across every resolved PV and then
+write the row to HDF5; with large PV lists or slow IOCs that round-trip
+can easily exceed the requested period and the loop will slip. The actual
+achieved rate is recorded in ``run_information_notes.achieved_rate_hz`` so
+callers can see what they really got. Beam-rate (120 Hz) archiving is out
 of scope here and would require EPICS monitors instead.
 
 Units note: ``@units`` is written as ``""`` because slac_db accessor rows
@@ -109,6 +113,7 @@ def _open_file_and_batch(
     notes: str,
     metadata: dict | None,
     missing_pvs: list[str],
+    requested_rate_hz: float | None,
 ) -> tuple[h5py.File, h5py.Group]:
     f = h5py.File(path, "w")
     f.attrs["Data_Standard_Version"] = _DATA_STANDARD_VERSION
@@ -126,6 +131,8 @@ def _open_file_and_batch(
         note_payload["metadata"] = metadata
     if missing_pvs:
         note_payload["missing_pvs"] = missing_pvs
+    if requested_rate_hz is not None:
+        note_payload["requested_rate_hz"] = requested_rate_hz
     batch.attrs["run_information_notes"] = json.dumps(note_payload)
     return f, batch
 
@@ -252,6 +259,7 @@ def _run(
         notes=notes,
         metadata=metadata,
         missing_pvs=missing,
+        requested_rate_hz=rate_hz,
     )
     try:
         obs = batch.create_group("observables")
@@ -261,11 +269,12 @@ def _run(
             datasets[pv] = _create_pv_dataset(obs, pv, loc, n_samples, _value_shape(v))
 
         kept_pvs = [pv for pv, _ in kept_pv_loc]
+        start_mono = time.monotonic()
         _write_sample(datasets, ts_dset, 0, kept_pvs, kept_values, first_ts)
 
         if n_samples > 1:
             period = 1.0 / rate_hz if rate_hz else 0.0
-            target = time.monotonic() + period
+            target = start_mono + period
             for i in range(1, n_samples):
                 sleep_for = target - time.monotonic()
                 if sleep_for > 0:
@@ -275,6 +284,21 @@ def _run(
                 values = _subsequent_read(kept_pvs, caget_timeout)
                 _write_sample(datasets, ts_dset, i, kept_pvs, values, _isotime())
                 target += period
+
+        if rate_hz is not None and n_samples > 1:
+            elapsed = time.monotonic() - start_mono
+            achieved = (n_samples - 1) / elapsed if elapsed > 0 else float("nan")
+            notes_payload = json.loads(batch.attrs["run_information_notes"])
+            notes_payload["achieved_rate_hz"] = achieved
+            batch.attrs["run_information_notes"] = json.dumps(notes_payload)
+            if rate_hz and achieved < 0.8 * rate_hz:
+                logger.warning(
+                    "Achieved %.2f Hz vs requested %.2f Hz over %d PVs; "
+                    "caget round-trip is the bottleneck",
+                    achieved,
+                    rate_hz,
+                    len(kept_pvs),
+                )
     finally:
         f.close()
     return path
@@ -321,6 +345,11 @@ def continuous(
     include_inactive: bool = False,
 ) -> Path:
     """Sample at ``rate_hz`` and accumulate into one Cropp-spec HDF5 file.
+
+    ``rate_hz`` is a **target**, not a guarantee -- actual throughput is
+    bounded by the time to ``caget_many`` the resolved PV list. For large
+    PV lists the loop will slip; the actual achieved rate is written to
+    ``run_information_notes.achieved_rate_hz`` in the output file.
 
     Exactly one of ``n_samples`` or ``duration_s`` must be provided.
     """

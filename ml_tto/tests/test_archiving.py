@@ -139,6 +139,9 @@ def test_continuous_appends_n_samples(archiver, tmp_path):
         assert tuple(batch.attrs["batch_dims"]) == (5,)
         notes = json.loads(batch.attrs["run_information_notes"])
         assert notes["metadata"] == {"operator": "test"}
+        assert notes["requested_rate_hz"] == 50.0
+        assert "achieved_rate_hz" in notes
+        assert notes["achieved_rate_hz"] > 0
 
         obs = batch["observables"]
         ts = obs["Timestamp"]
