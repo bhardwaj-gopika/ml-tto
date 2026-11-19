@@ -23,6 +23,7 @@ import datetime
 import hashlib
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Iterable, Union
@@ -37,11 +38,9 @@ logger = logging.getLogger(__name__)
 
 def _isotime() -> str:
     return (
-        datetime.datetime.now()
-        .replace(tzinfo=datetime.timezone.utc)
+        datetime.datetime.now(datetime.timezone.utc)
         .astimezone()
-        .replace(microsecond=0)
-        .isoformat()
+        .isoformat(timespec="microseconds")
     )
 
 
@@ -134,6 +133,7 @@ def _open_file_and_batch(
     metadata: dict | None,
     missing_pvs: list[str],
     requested_rate_hz: float | None,
+    duration_s: float | None = None,
 ) -> tuple[h5py.File, h5py.Group]:
     f = h5py.File(path, "w")
     f.attrs["Data_Standard_Version"] = _DATA_STANDARD_VERSION
@@ -153,6 +153,8 @@ def _open_file_and_batch(
         note_payload["missing_pvs"] = missing_pvs
     if requested_rate_hz is not None:
         note_payload["requested_rate_hz"] = requested_rate_hz
+    if duration_s is not None:
+        note_payload["duration_s_requested"] = duration_s
     batch.attrs["run_information_notes"] = json.dumps(note_payload)
     return f, batch
 
@@ -256,6 +258,7 @@ def _run(
     path: Union[str, Path],
     n_samples: int,
     rate_hz: float | None,
+    duration_s: float | None,
     run_source: str,
     notes: str,
     metadata: dict | None,
@@ -288,34 +291,49 @@ def _run(
         metadata=metadata,
         missing_pvs=missing,
         requested_rate_hz=rate_hz,
+        duration_s=duration_s,
     )
+    ts_dset: h5py.Dataset | None = None
+    datasets: dict[str, h5py.Dataset] = {}
+    rows_written = 0
+    clean_exit = False
     try:
         obs = batch.create_group("observables")
         ts_dset = _create_timestamp_dataset(obs, n_samples)
-        datasets: dict[str, h5py.Dataset] = {}
         for (pv, loc), v in zip(kept_pv_loc, kept_values):
             datasets[pv] = _create_pv_dataset(obs, pv, loc, n_samples, v)
 
         kept_pvs = [pv for pv, _ in kept_pv_loc]
         start_mono = time.monotonic()
+        deadline_mono = (start_mono + duration_s) if duration_s is not None else None
         _write_sample(datasets, ts_dset, 0, kept_pvs, kept_values, first_ts)
+        rows_written = 1
 
         if n_samples > 1:
             period = 1.0 / rate_hz if rate_hz else 0.0
             target = start_mono + period
             for i in range(1, n_samples):
+                if deadline_mono is not None and time.monotonic() >= deadline_mono:
+                    break
                 sleep_for = target - time.monotonic()
+                if deadline_mono is not None:
+                    sleep_for = min(sleep_for, deadline_mono - time.monotonic())
                 if sleep_for > 0:
                     time.sleep(sleep_for)
-                else:
-                    logger.warning("Sample %d slipped by %.3fs", i, -sleep_for)
+                elif target < time.monotonic():
+                    logger.warning(
+                        "Sample %d slipped by %.3fs", i, time.monotonic() - target
+                    )
+                if deadline_mono is not None and time.monotonic() >= deadline_mono:
+                    break
                 values = _subsequent_read(kept_pvs, caget_timeout)
                 _write_sample(datasets, ts_dset, i, kept_pvs, values, _isotime())
+                rows_written = i + 1
                 target += period
 
-        if rate_hz is not None and n_samples > 1:
+        if rate_hz is not None and rows_written > 1:
             elapsed = time.monotonic() - start_mono
-            achieved = (n_samples - 1) / elapsed if elapsed > 0 else float("nan")
+            achieved = (rows_written - 1) / elapsed if elapsed > 0 else float("nan")
             notes_payload = json.loads(batch.attrs["run_information_notes"])
             notes_payload["achieved_rate_hz"] = achieved
             batch.attrs["run_information_notes"] = json.dumps(notes_payload)
@@ -327,9 +345,58 @@ def _run(
                     rate_hz,
                     len(kept_pvs),
                 )
+        clean_exit = True
     finally:
-        f.close()
+        try:
+            _truncate_to_written(
+                batch, ts_dset, datasets, rows_written, n_samples, clean_exit
+            )
+        finally:
+            f.close()
     return path
+
+
+def _truncate_to_written(
+    batch: h5py.Group,
+    ts_dset: h5py.Dataset | None,
+    datasets: dict[str, h5py.Dataset],
+    rows_written: int,
+    requested: int,
+    clean_exit: bool,
+) -> None:
+    """Shrink every dataset to the fully-written row count, update batch_dims.
+
+    ``clean_exit`` distinguishes a normal end (count hit, or duration-mode
+    deadline hit before the preallocated row count) from an exception
+    bubbling through the try block. Only the latter sets ``interrupted``
+    in the notes. No-op when ``ts_dset is None`` (dataset creation never
+    ran) or when the preallocated size matches what was written.
+    """
+    if ts_dset is None or rows_written == requested:
+        return
+    ts_dset.resize((rows_written,))
+    for d in datasets.values():
+        d.resize((rows_written, *d.shape[1:]))
+    batch.attrs["batch_dims"] = np.array([rows_written], dtype=np.int64)
+    notes_payload = json.loads(batch.attrs["run_information_notes"])
+    notes_payload["samples_written"] = rows_written
+    notes_payload["samples_preallocated"] = requested
+    if not clean_exit:
+        notes_payload["interrupted"] = True
+    batch.attrs["run_information_notes"] = json.dumps(notes_payload)
+    if clean_exit:
+        logger.info(
+            "Archive run ended before preallocated count (likely duration "
+            "deadline): wrote %d of %d rows",
+            rows_written,
+            requested,
+        )
+    else:
+        logger.warning(
+            "Archive run interrupted: wrote %d of %d samples; truncated datasets",
+            rows_written,
+            requested,
+        )
 
 
 def snapshot(
@@ -350,6 +417,7 @@ def snapshot(
         path=path,
         n_samples=1,
         rate_hz=None,
+        duration_s=None,
         run_source=run_source,
         notes=notes,
         metadata=metadata,
@@ -384,8 +452,16 @@ def continuous(
         raise ValueError("Provide exactly one of n_samples or duration_s.")
     if rate_hz <= 0:
         raise ValueError("rate_hz must be positive.")
+    if n_samples is not None and n_samples <= 0:
+        raise ValueError("n_samples must be positive.")
+    if duration_s is not None and duration_s <= 0:
+        raise ValueError("duration_s must be positive.")
     if n_samples is None:
-        n_samples = max(1, int(round(duration_s * rate_hz)))
+        # Preallocate an upper bound; _run breaks the loop on the real
+        # monotonic deadline and _truncate_to_written shrinks to what
+        # actually fit. +1 to leave room for the always-written first
+        # sample regardless of duration vs cadence rounding.
+        n_samples = math.ceil(duration_s * rate_hz) + 1
 
     return _run(
         areas,
@@ -393,6 +469,7 @@ def continuous(
         path=path,
         n_samples=n_samples,
         rate_hz=rate_hz,
+        duration_s=duration_s,
         run_source=run_source,
         notes=notes,
         metadata=metadata,

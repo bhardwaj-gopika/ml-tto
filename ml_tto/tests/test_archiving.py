@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 import types
 from datetime import datetime
 
@@ -32,7 +33,22 @@ def _install_fake_epics(caget_many_fn):
 
 
 @pytest.fixture
-def archiver(monkeypatch):
+def archiver(request):
+    missing = object()
+    originals = {
+        name: sys.modules.get(name, missing)
+        for name in ("slac_db", "slac_db.device", "epics")
+    }
+
+    def restore_modules():
+        for name, previous in originals.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+    request.addfinalizer(restore_modules)
+
     _install_fake_slac_db(
         areas_to_devices={
             "GUNB": ["SOLN:IN20:121", "QUAD:IN20:121"],
@@ -144,6 +160,92 @@ def test_snapshot_handles_string_pv(archiver, tmp_path):
         n = obs["LGPS:IN20:1:BACT"]
         assert n.dtype == np.float64
         assert n[0] == 1.5
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"n_samples": 0}, "n_samples must be positive"),
+        ({"n_samples": -5}, "n_samples must be positive"),
+        ({"duration_s": 0}, "duration_s must be positive"),
+        ({"duration_s": -0.1}, "duration_s must be positive"),
+        ({}, "Provide exactly one"),
+        ({"n_samples": 1, "duration_s": 1.0}, "Provide exactly one"),
+    ],
+)
+def test_continuous_rejects_bad_inputs(archiver, tmp_path, kwargs, match):
+    _install_fake_epics(lambda pvs, timeout=None: [0.0] * len(pvs))
+    with pytest.raises(ValueError, match=match):
+        archiver.continuous("GUNB", path=tmp_path / "x.h5", rate_hz=1.0, **kwargs)
+
+
+def test_continuous_duration_stops_at_deadline(archiver, tmp_path):
+    counter = {"n": 0}
+
+    def fake_caget(pvs, timeout=None):
+        counter["n"] += 1
+        time.sleep(0.12)  # each cycle ~120 ms; rate_hz=50 asks for 20 ms
+        return [float(counter["n"] + i) for i, _ in enumerate(pvs)]
+
+    _install_fake_epics(fake_caget)
+
+    out = tmp_path / "duration.h5"
+    t0 = time.monotonic()
+    archiver.continuous("GUNB", path=out, rate_hz=50.0, duration_s=0.3)
+    elapsed = time.monotonic() - t0
+
+    # Should NOT run the ceil(0.3 * 50) + 1 = 16 preallocated iterations
+    # (that would take >= 16 * 0.12 = 1.92 s). Must stop near 0.3 s.
+    assert elapsed < 1.0, f"duration mode did not stop at deadline: {elapsed:.3f}s"
+
+    with h5py.File(out, "r") as f:
+        ids = [s.decode() if isinstance(s, bytes) else s for s in f.attrs["IDs"]]
+        batch = f[ids[0]]
+        n_written = int(batch.attrs["batch_dims"][0])
+        assert 1 <= n_written <= 4  # ~0.3s / 0.12s per cycle
+        notes = json.loads(batch.attrs["run_information_notes"])
+        assert "interrupted" not in notes  # clean duration exit != interrupted
+        assert notes["samples_written"] == n_written
+        assert notes["duration_s_requested"] == 0.3
+
+        assert batch["observables"]["Timestamp"].shape == (n_written,)
+
+
+def test_continuous_truncates_on_interrupt(archiver, tmp_path):
+    counter = {"n": 0}
+
+    def fake_caget(pvs, timeout=None):
+        counter["n"] += 1
+        if counter["n"] >= 4:
+            raise KeyboardInterrupt("simulated Ctrl-C")
+        return [float(counter["n"] + i) for i, _ in enumerate(pvs)]
+
+    _install_fake_epics(fake_caget)
+
+    out = tmp_path / "interrupted.h5"
+    with pytest.raises(KeyboardInterrupt):
+        archiver.continuous(
+            "GUNB",
+            path=out,
+            rate_hz=50.0,
+            n_samples=10,
+        )
+
+    with h5py.File(out, "r") as f:
+        ids = [s.decode() if isinstance(s, bytes) else s for s in f.attrs["IDs"]]
+        batch = f[ids[0]]
+        assert tuple(batch.attrs["batch_dims"]) == (3,)
+        notes = json.loads(batch.attrs["run_information_notes"])
+        assert notes["interrupted"] is True
+        assert notes["samples_written"] == 3
+        assert notes["samples_preallocated"] == 10
+
+        obs = batch["observables"]
+        assert obs["Timestamp"].shape == (3,)
+        for name in obs.keys():
+            if name == "Timestamp":
+                continue
+            assert obs[name].shape[0] == 3
 
 
 def test_continuous_appends_n_samples(archiver, tmp_path):
